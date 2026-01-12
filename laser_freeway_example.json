@@ -1,0 +1,37 @@
+{
+  "game": "Freeway",
+
+  "task_mods": [
+    [],
+    ["all_black_cars"]
+  ],
+
+  "task_prompt": "You are playing Atari Freeway. Try to cross the road without getting hit by cars.",
+
+  "total_timesteps_per_task": 200000,
+  "eval_episodes": 20,
+  "output_path": "./results_laser_freeway_seq.json",
+
+  "seed": 0,
+  "device": "cuda",
+
+  "vlm_model_id": "llava-hf/llava-v1.6-mistral-7b-hf",
+  "vlm_cache_dir": "./vlm_cache",
+
+  "lambda_kl": 0.01,
+  "beta": 1.0,
+
+  "ppo_policy": "CnnPolicy",
+  "learning_rate": 0.0003,
+  "n_steps": 128,
+  "batch_size": 256,
+  "n_epochs": 4,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "clip_range": 0.2,
+  "ent_coef": 0.0,
+  "vf_coef": 0.5,
+  "max_grad_norm": 0.5,
+  "verbose": 1,
+  "tensorboard_log": "./tb_laser_logs"
+}
