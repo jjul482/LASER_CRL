@@ -1,14 +1,20 @@
+# laser_trainer.py
+
 import json
-import os
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, VecTransposeImage
-from stable_baselines3.common.callbacks import BaseCallback
+from typing import Dict, Any, List
+
+import torch
 import numpy as np
-import time
+import random
+
+from laser import LASER, AtariVLM
+from trainer_old import make_pixel_env, make_env
+
+import json
+from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, VecTransposeImage
+import numpy as np
 import gymnasium as gym
 from hackatari.core import HackAtari
-from eval import evaluate
-import copy
 
 from stable_baselines3.common.env_checker import check_env
 
@@ -30,15 +36,11 @@ def make_env(game_name, modifications=[], rewardfunc_path=None):
     """
     # rewardfunc_path = "freeway_custom_reward.py"
     env = HackAtari(game_name, modifs=modifications, rewardfunc_path=rewardfunc_path, obs_mode="ori")
-    # Apply modification if provided
     if len(modifications) > 0:
         print(f"Applied modifications: {modifications}")
     
     # Custom reward?
-    #print(env.org_reward)
     print("Obs space:", env.observation_space)
-    # obs, _ = env.reset()
-    #print("Obs sample:", obs[:10])
     env = Float32Wrapper(env)
     return env
 
@@ -57,100 +59,125 @@ def make_pixel_env(game_name, mods, mode='ori'):  # mode in {"ori","dqn"}
 
     return venv
 
-class SimpleLoggerCallback(BaseCallback):
-    def __init__(self, log_every_steps=1000, verbose=0):
-        super().__init__(verbose)
-        self.log_every_steps = log_every_steps
-        self._last_logged = 0
+def build_ppo_kwargs(args: Dict[str, Any]) -> Dict[str, Any]:
+    return dict(
+        learning_rate=args.get("learning_rate", 3e-4),
+        n_steps=args.get("n_steps", 128),
+        batch_size=args.get("batch_size", 256),
+        n_epochs=args.get("n_epochs", 4),
+        gamma=args.get("gamma", 0.99),
+        gae_lambda=args.get("gae_lambda", 0.95),
+        clip_range=args.get("clip_range", 0.2),
+        ent_coef=args.get("ent_coef", 0.0),
+        vf_coef=args.get("vf_coef", 0.5),
+        max_grad_norm=args.get("max_grad_norm", 0.5),
+        verbose=args.get("verbose", 1),
+        tensorboard_log=args.get("tensorboard_log", None),
+    )
 
-    def _on_step(self):
-        if (self.num_timesteps - self._last_logged) >= self.log_every_steps:
-            self._last_logged = self.num_timesteps
-            # Print mean reward for last 100 episodes
-            ep_info = self.locals.get('infos', [])
-            ep_rewards = [info['episode']['r'] for info in ep_info if 'episode' in info]
-            if ep_rewards:
-                print(f"[{time.strftime('%H:%M:%S')}] timesteps={self.num_timesteps}, mean_reward(last100)={np.mean(ep_rewards):.2f}")
-        return True
 
-def train_on_task(model, total_timesteps=100_000, model_save_path=None, render_mode=None):
+def train(args: Dict[str, Any]) -> None:
     """
-    Train PPO on a single HackAtari variation, return trained model.
+    LASER training
+
+    Expected keys:
+        - game
+        - task_mods           : list[list[str]]
+        - task_prompt         : single string, used for all tasks
+        - total_timesteps_per_task
+        - eval_episodes
+        - output_path
+        - VLM + LASER params
+        - PPO params
     """
-    cb = SimpleLoggerCallback(log_every_steps=100000)
-    model.learn(total_timesteps=total_timesteps, callback=cb)
-    if model_save_path:
-        model.save(model_save_path)
-    return model
 
-def train(args):
-    seed_list = copy.deepcopy(args["seed"])
-    device = copy.deepcopy(args["device"])
+    game: str = args["game"]
+    task_mods_list: List[List[str]] = args["task_mods"]
+    task_prompt: str = args["task_prompt"] 
 
-    for seed in seed_list:
-        args["seed"] = seed
-        args["device"] = device
-        _train(args)
+    total_timesteps_per_task: int = int(args.get("total_timesteps_per_task", 200_000))
+    eval_episodes: int = int(args.get("eval_episodes", 20))
+    output_path: str = args.get("output_path", f"./results_laser_{game}.json")
 
-def _train(args):
-    game = args["game"]
-    taskA_mods = args["taskA_mods"]                # baseline task
-    taskB_mods = args["taskB_mods"]  
-    timesteps_per_task = args["total_timesteps"]
-    model_type = args["model_type"][0]
+    device: str = args.get("device", "cuda")
+    lambda_kl: float = float(args.get("lambda_kl", 1e-2))
+    beta: float = float(args.get("beta", 1.0))
+    vlm_model_id: str = args.get("vlm_model_id", "llava-hf/llava-v1.6-mistral-7b-hf")
+    vlm_cache_dir: str = args.get("vlm_cache_dir", None)
 
-    taskA_save_path = f"{model_type}_{game}_taskA"
-    taskB_save_path = f"{model_type}_{game}_taskB"
+    ppo_policy: str = args.get("ppo_policy", "CnnPolicy")
+    ppo_kwargs = build_ppo_kwargs(args)
 
-    env_tmp = HackAtari(game)
-    print(f"Available modifications for {game}:", env_tmp.available_modifications)
+    # Seed everything
+    seed = args.get("seed", 0)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    results = {
-        "game": game,
-        "taskA_mod": taskA_mods,
-        "taskB_mod": taskB_mods,
-        "timesteps_per_task": timesteps_per_task,
+    vlm = AtariVLM(
+        model_id=vlm_model_id,
+        device=device,
+        cache_dir=vlm_cache_dir,
+        dtype=torch.float16,
+    )
+
+    laser_agent = None
+    all_results = []
+
+    for task_idx, mods in enumerate(task_mods_list):
+        print(f"\n[LASER] ===== Task {task_idx} / {len(task_mods_list)-1} =====")
+        print(f"[LASER] Game: {game}")
+        print(f"[LASER] Mods: {mods}")
+        print(f"[LASER] Using single prompt: {task_prompt}")
+
+        venv = make_pixel_env(game, mods)
+
+        eval_env = make_env(game, mods)
+
+        if laser_agent is None:
+            print("[LASER] Initialising LASER agent...")
+            laser_agent = LASER(
+                env=venv,
+                vlm=vlm,
+                task_prompt=task_prompt,      # same prompt for all tasks
+                lambda_kl=lambda_kl,
+                beta=beta,
+                device=device,
+                ppo_policy=ppo_policy,
+                ppo_kwargs=ppo_kwargs,
+            )
+        else:
+            print("[LASER] Switching env (continual). Prompt unchanged.")
+            laser_agent.env = venv
+            laser_agent.model.set_env(venv)
+        
+        print(f"[LASER] Training for {total_timesteps_per_task} timesteps...")
+        laser_agent.train(total_timesteps=total_timesteps_per_task)
+
+        mean_rew, std_rew = laser_agent.evaluate(
+            eval_env=eval_env,
+            n_episodes=eval_episodes,
+            render=False,
+        )
+        print(f"[LASER] Task {task_idx} evaluation: "
+              f"mean={mean_rew:.2f} ± {std_rew:.2f}")
+
+        all_results.append(
+            {
+                "task_index": task_idx,
+                "mods": mods,
+                "prompt": task_prompt,
+                "mean_reward": mean_rew,
+                "std_reward": std_rew
+            }
+        )
+
+    output = {
+        "config": args,
+        "results": all_results,
     }
-
-    venvA = make_pixel_env(game, taskA_mods)
-    venvB = make_pixel_env(game, taskB_mods)
-    modelA, modelB = None, None
-    if model_type == "ppo":
-        modelA = PPO('MlpPolicy', venvA, verbose=1, tensorboard_log="./tb_logs", device="cuda")
-        modelB = PPO('MlpPolicy', venvB, verbose=1, tensorboard_log="./tb_logs", device="cuda")
-
-    print("Training on Task A (baseline)...")
-    modelA = train_on_task(modelA, total_timesteps=timesteps_per_task, model_save_path=taskA_save_path)
-    print("Evaluating agent trained on Task A:")
-    meanA, stdA = evaluate(venvA, modelA, n_episodes=20)
-    print(f"Task A eval (after A train): mean={meanA:.2f} ±{stdA:.2f}")
-    results['A_after_A_mean'] = meanA
-
-    # Evaluate A agent on Task B (transfer baseline)
-    envB_for_eval = make_env(game, taskB_mods)
-    meanA_on_B, _ = evaluate(envB_for_eval, modelA, n_episodes=20)
-    print(f"Task A agent on Task B (zero-shot): mean={meanA_on_B:.2f}")
-    results['A_on_B_before_B_train'] = meanA_on_B
-
-    # Train new model on Task B
-    print("Training on Task B (modified)...")
-    modelB = train_on_task(modelB, total_timesteps=timesteps_per_task, model_save_path=taskB_save_path)
-    meanB_afterB, _ = evaluate(venvB, modelB, n_episodes=20)
-    print(f"Task B eval (after B train): mean={meanB_afterB:.2f}")
-    results['B_after_B_mean'] = meanB_afterB
-
-    envA_for_eval = make_env(game, taskA_mods)
-    meanB_on_A_afterB, _ = evaluate(envA_for_eval, modelB, n_episodes=20)
-    print(f"Model after B-training evaluated on A: mean={meanB_on_A_afterB:.2f}")
-    results['A_after_B_mean'] = meanB_on_A_afterB
-    #watch_agent(envA, modelA, n_episodes=1)
-
-    # Compute forgetting metric (simple)
-    results['forgetting_A'] = results['A_after_A_mean'] - results['A_after_B_mean']
-
-    # Save results
-    out_path = f"{model_type}_{game}_results.json"
-    with open(out_path, "w") as f:
-        json.dump(results, f, indent=2)
-    print("Saved results to", out_path)
-    print(json.dumps(results, indent=2))
+    print(f"[LASER] Writing results to: {output_path}")
+    with open(output_path, "w") as f:
+        json.dump(output, f, indent=2)

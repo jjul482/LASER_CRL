@@ -6,8 +6,8 @@ import json
 def main():
     args = setup_parser().parse_args()
     param = load_json(args.config)
-    args = vars(args) # Converting argparse Namespace to a dict.
-    args.update(param) # Add parameters from json
+    args = vars(args)
+    args.update(param)
 
     train(args)
 
@@ -18,7 +18,7 @@ def load_json(setting_path):
 
 def setup_parser():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='./exps/ppo_boxing_one_armed.json',)
+    parser.add_argument('--config', type=str, default='./exps/laser_freeway_example.json',)
     return parser
 
 if __name__ == "__main__":
