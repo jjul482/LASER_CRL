@@ -8,7 +8,6 @@ import numpy as np
 import random
 
 from laser import LASER, AtariVLM
-from trainer_old import make_pixel_env, make_env
 
 import json
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor, VecTransposeImage
